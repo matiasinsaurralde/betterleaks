@@ -6,10 +6,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/betterleaks/betterleaks/internal/ahocorasick"
 	"github.com/betterleaks/betterleaks/internal/words"
 	blregexp "github.com/betterleaks/betterleaks/regexp"
 	tiktoken "github.com/pkoukk/tiktoken-go"
-	ahocorasick "github.com/rrethy/ahocorasick"
 )
 
 var (
@@ -64,7 +64,9 @@ func getOrBuildTrie(terms []string) *ahocorasick.Matcher {
 	if v, ok := acTrieCache.Load(key); ok {
 		return v.(*ahocorasick.Matcher)
 	}
-	trie := ahocorasick.CompileStrings(terms)
+	// foldASCII=false preserves legacy containsAny semantics: patterns are matched
+	// as written against a lowercased haystack (see containsAny).
+	trie := ahocorasick.Compile(terms, false)
 	acTrieCache.Store(key, trie)
 	return trie
 }
@@ -84,7 +86,16 @@ func findMatch(s, pattern string) string {
 
 func containsAny(s string, terms any) bool {
 	trie := getOrBuildTrie(toStringSlice(terms))
-	return trie != nil && len(trie.FindAllString(strings.ToLower(s))) > 0
+	if trie == nil {
+		return false
+	}
+	found := false
+	// Lowercase haystack to match legacy rrethy FindAllString(strings.ToLower(s)).
+	trie.Visit(strings.ToLower(s), func(_, _, _ int) bool {
+		found = true
+		return false // first hit is enough
+	})
+	return found
 }
 
 func toStringSlice(v any) []string {
@@ -149,13 +160,13 @@ func failsTokenEfficiency(tke *tiktoken.Tiktoken, secret string) bool {
 	if len(tokens) == 0 {
 		return false
 	}
-	if len(words.HasMatchInList(analyzed, 5)) > 0 {
+	if words.ContainsWord(analyzed, 5) {
 		return true
 	}
 	threshold := 2.5
 	if len(analyzed) < 12 {
 		threshold = 2.1
-		if len(words.HasMatchInList(analyzed, 4)) == 0 {
+		if !words.ContainsWord(analyzed, 4) {
 			threshold = 2.5
 		}
 	}

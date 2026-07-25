@@ -398,10 +398,9 @@ func (s *S3) scanObject(ctx context.Context, client *http.Client, target s3Targe
 }
 
 // wrapYieldWithAttrs returns a yield that stamps the given attrs on every
-// fragment, re-applies ShouldSkip with the merged attrs, and serializes calls
-// through a mutex. Mirrors the GitHub source.
+// fragment and re-applies ShouldSkip with the merged attrs. Detection is
+// concurrent; each fragment owns its attribute map after stamping.
 func (s *S3) wrapYieldWithAttrs(attrs map[string]string, yield FragmentsFunc) FragmentsFunc {
-	var mu sync.Mutex
 	return func(fragment Fragment, err error) error {
 		if err == nil {
 			for k, v := range attrs {
@@ -418,8 +417,6 @@ func (s *S3) wrapYieldWithAttrs(attrs map[string]string, yield FragmentsFunc) Fr
 				return nil
 			}
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		return yield(fragment, err)
 	}
 }

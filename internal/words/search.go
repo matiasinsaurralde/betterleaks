@@ -15,14 +15,39 @@ type Match struct {
 	Len  int
 }
 
+func ensureWordsLoaded() {
+	// Trigger the lazy load. sync.Once guarantees this is thread-safe and
+	// only executes the decompression once, even with thousands of goroutines.
+	wordsOnce.Do(loadWords)
+}
+
+// ContainsWord reports whether any dictionary word of length >= minLen appears
+// as a substring of word. It returns on the first hit and allocates nothing on
+// the common miss path beyond the lowercased copy of word.
+func ContainsWord(word string, minLen int) bool {
+	ensureWordsLoaded()
+
+	word = strings.ToLower(word)
+	if len(word) < minLen {
+		return false
+	}
+
+	for start := 0; start <= len(word)-minLen; start++ {
+		for length := minLen; start+length <= len(word); length++ {
+			if _, exists := nltkWords[word[start:start+length]]; exists {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HasMatchInList finds all dictionary words that appear as substrings of word,
 // matching Aho-Corasick–style behavior by walking the word: at each starting
 // position we check every substring length >= minLen. Returns one Result
 // aggregating all matches, or nil if none.
 func HasMatchInList(word string, minLen int) []Result {
-	// Trigger the lazy load. sync.Once guarantees this is thread-safe and
-	// only executes the decompression once, even with thousands of goroutines.
-	wordsOnce.Do(loadWords)
+	ensureWordsLoaded()
 
 	word = strings.ToLower(word)
 	if len(word) < minLen {

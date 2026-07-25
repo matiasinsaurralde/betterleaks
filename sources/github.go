@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -473,10 +472,10 @@ func (s *GitHub) scanRepo(ctx context.Context, client *github.Client, repo *gith
 	return nil
 }
 
-// wrapYieldWithAttrs returns a yield function that stamps attrs on every fragment,
-// applies ShouldSkip, and serializes calls through a mutex.
+// wrapYieldWithAttrs returns a yield function that stamps attrs on every fragment
+// and applies ShouldSkip. Detection runs concurrently (same as Files); each
+// fragment owns its attribute map after stamping.
 func (s *GitHub) wrapYieldWithAttrs(attrs map[string]string, yield FragmentsFunc) FragmentsFunc {
-	var mu sync.Mutex
 	return func(fragment Fragment, err error) error {
 		if err == nil {
 			for k, v := range attrs {
@@ -489,8 +488,6 @@ func (s *GitHub) wrapYieldWithAttrs(attrs map[string]string, yield FragmentsFunc
 				return nil
 			}
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		return yield(fragment, err)
 	}
 }

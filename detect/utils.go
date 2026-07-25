@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/betterleaks/betterleaks/logging"
 	"github.com/betterleaks/betterleaks/report"
@@ -127,6 +128,23 @@ func shannonEntropy(data string) (entropy float64) {
 		return 0
 	}
 
+	// Secrets are almost always ASCII; avoid map allocation on the hot path.
+	if isASCII(data) {
+		var charCounts [256]int
+		for i := 0; i < len(data); i++ {
+			charCounts[data[i]]++
+		}
+		invLength := 1.0 / float64(len(data))
+		for _, count := range charCounts {
+			if count == 0 {
+				continue
+			}
+			freq := float64(count) * invLength
+			entropy -= freq * math.Log2(freq)
+		}
+		return entropy
+	}
+
 	charCounts := make(map[rune]int)
 	for _, char := range data {
 		charCounts[char]++
@@ -141,12 +159,29 @@ func shannonEntropy(data string) (entropy float64) {
 	return entropy
 }
 
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+type specificityKey struct {
+	line int
+	sha  string
+}
+
 // filter will dedupe and redact findings
 func filter(findings []report.Finding) []report.Finding {
 	// Collect every required finding's (line, secret) so we can suppress
 	// standalone duplicates that are already surfaced as components.
 	requiredSet := make(map[string]struct{})
-	for _, f := range findings {
+	byLine := make(map[specificityKey][]int, len(findings))
+	for i, f := range findings {
+		byLine[specificityKey{line: f.StartLine, sha: f.Attributes[sources.AttrGitSHA]}] = append(
+			byLine[specificityKey{line: f.StartLine, sha: f.Attributes[sources.AttrGitSHA]}], i)
 		for _, set := range f.RequiredSets {
 			for _, comp := range set.Components {
 				requiredSet[fmt.Sprintf("%d:%s", comp.StartLine, comp.Secret)] = struct{}{}
@@ -164,7 +199,7 @@ func filter(findings []report.Finding) []report.Finding {
 			redactedMatch := strings.ReplaceAll(f.Match, f.Secret, "REDACTED")
 			logging.Trace().Msgf("skipping %s finding (%s), already a required component of another finding", f.RuleID, redactedMatch)
 			include = false
-		} else if isSuppressedByHigherSpecificityFinding(f, findings) {
+		} else if isSuppressedByHigherSpecificityFindingIndexed(f, findings, byLine) {
 			include = false
 		}
 
@@ -176,10 +211,19 @@ func filter(findings []report.Finding) []report.Finding {
 }
 
 func isSuppressedByHigherSpecificityFinding(f report.Finding, findings []report.Finding) bool {
-	for _, fPrime := range findings {
-		if f.StartLine == fPrime.StartLine &&
-			f.Attributes[sources.AttrGitSHA] == fPrime.Attributes[sources.AttrGitSHA] &&
-			f.RuleID != fPrime.RuleID &&
+	byLine := make(map[specificityKey][]int, len(findings))
+	for i, fPrime := range findings {
+		byLine[specificityKey{line: fPrime.StartLine, sha: fPrime.Attributes[sources.AttrGitSHA]}] = append(
+			byLine[specificityKey{line: fPrime.StartLine, sha: fPrime.Attributes[sources.AttrGitSHA]}], i)
+	}
+	return isSuppressedByHigherSpecificityFindingIndexed(f, findings, byLine)
+}
+
+func isSuppressedByHigherSpecificityFindingIndexed(f report.Finding, findings []report.Finding, byLine map[specificityKey][]int) bool {
+	key := specificityKey{line: f.StartLine, sha: f.Attributes[sources.AttrGitSHA]}
+	for _, idx := range byLine[key] {
+		fPrime := findings[idx]
+		if f.RuleID != fPrime.RuleID &&
 			strings.Contains(fPrime.Secret, f.Secret) &&
 			fPrime.RuleSpecificity > f.RuleSpecificity {
 			genericMatch := strings.ReplaceAll(f.Match, f.Secret, "REDACTED")
@@ -187,6 +231,9 @@ func isSuppressedByHigherSpecificityFinding(f report.Finding, findings []report.
 			logging.Debug().Msgf("skipping %s finding (%s), %s rule takes precedence (%s)", f.RuleID, genericMatch, fPrime.RuleID, betterMatch)
 			return true
 		}
+	}
+	// RequiredSets may suppress across different SHAs/lines via component StartLine.
+	for _, fPrime := range findings {
 		for _, set := range fPrime.RequiredSets {
 			for _, comp := range set.Components {
 				if f.StartLine == comp.StartLine &&

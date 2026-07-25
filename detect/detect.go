@@ -147,6 +147,14 @@ type Detector struct {
 	// keyword strings and map lookups while scanning each fragment.
 	keywordRuleIndexes [][]int
 
+	// keywordRuleCount is the number of distinct rules referenced by
+	// keywordRuleIndexes. Visit can stop once this many rules are marked.
+	keywordRuleCount int
+
+	// rulesByPtr holds pointers into Config.Rules in rulesBySpecificity order so
+	// the hot scan loop does not copy Rule values.
+	rulesByPtr []*config.Rule
+
 	// noKeywordIndexes contains positions in rulesBySpecificity for rules with no
 	// keyword prefilter. These rules are candidates on every scan and decode pass.
 	noKeywordIndexes []int
@@ -266,13 +274,19 @@ func NewDetectorContext(ctx context.Context, cfg *config.Config, valOpts Validat
 		ValidationExtractEmpty: valOpts.ExtractEmpty,
 	}
 	d.rulesBySpecificity = orderedRulesBySpecificity(cfg)
+	d.rulesByPtr = make([]*config.Rule, len(d.rulesBySpecificity))
 	// The matcher returns stable keyword indexes. Resolve those to rule indexes
 	// once so the hot scan loop does not allocate strings or maps.
 	d.keywordRuleIndexes = make([][]int, len(keywords))
 	ruleIndexes := make(map[string]int, len(d.rulesBySpecificity))
 	for i, ruleID := range d.rulesBySpecificity {
 		ruleIndexes[ruleID] = i
+		if rule, ok := cfg.Rules[ruleID]; ok {
+			r := rule // heap-escape copy; Config.Rules stays map[string]Rule
+			d.rulesByPtr[i] = &r
+		}
 	}
+	keywordRules := make(map[int]struct{})
 	for patternID, keyword := range keywords {
 		ruleIDs := cfg.KeywordToRules[keyword]
 		for _, ruleID := range ruleIDs {
@@ -280,12 +294,23 @@ func NewDetectorContext(ctx context.Context, cfg *config.Config, valOpts Validat
 			if !ok {
 				continue
 			}
+			rule := cfg.Rules[ruleID]
+			// SkipReport rules are only evaluated via processRequiredRules with
+			// InheritedFromFinding set; keep them out of the main candidate path.
+			if rule.SkipReport {
+				continue
+			}
 			d.keywordRuleIndexes[patternID] = append(d.keywordRuleIndexes[patternID], ruleIndex)
+			keywordRules[ruleIndex] = struct{}{}
 		}
 	}
+	d.keywordRuleCount = len(keywordRules)
 	for _, ruleID := range cfg.NoKeywordRules {
 		ruleIndex, ok := ruleIndexes[ruleID]
 		if !ok {
+			continue
+		}
+		if cfg.Rules[ruleID].SkipReport {
 			continue
 		}
 		d.noKeywordIndexes = append(d.noKeywordIndexes, ruleIndex)
@@ -706,8 +731,9 @@ func (d *Detector) detectFragment(ctx context.Context, fragment sources.Fragment
 
 	if fragment.Bytes == nil {
 		d.TotalBytes.Add(uint64(len(fragment.Raw)))
+	} else {
+		d.TotalBytes.Add(uint64(len(fragment.Bytes)))
 	}
-	d.TotalBytes.Add(uint64(len(fragment.Bytes)))
 
 	findings := []report.Finding{}
 
@@ -726,9 +752,17 @@ ScanLoop:
 			candidates := d.candidatePool.Get().(*ruleCandidates)
 			// A rule is a candidate when any of its keywords matched. The bitmap
 			// deduplicates rules referenced by multiple matching keywords.
+			markedKeywordRules := 0
 			d.prefilter.Visit(currentRaw, func(patternID, _, _ int) bool {
 				for _, ruleIndex := range d.keywordRuleIndexes[patternID] {
+					if candidates.marked[ruleIndex] {
+						continue
+					}
 					candidates.marked[ruleIndex] = true
+					markedKeywordRules++
+					if d.keywordRuleCount > 0 && markedKeywordRules >= d.keywordRuleCount {
+						return false
+					}
 				}
 				return true
 			})
@@ -737,8 +771,8 @@ ScanLoop:
 				candidates.marked[ruleIndex] = true
 			}
 
-			for ruleIndex, ruleID := range d.rulesBySpecificity {
-				if !candidates.marked[ruleIndex] {
+			for ruleIndex, rule := range d.rulesByPtr {
+				if rule == nil || !candidates.marked[ruleIndex] {
 					continue
 				}
 				select {
@@ -747,8 +781,7 @@ ScanLoop:
 					d.candidatePool.Put(candidates)
 					break ScanLoop
 				default:
-					rule := d.Config.Rules[ruleID]
-					findings = append(findings, d.detectFragmentWithRuleTimed(fragment, currentRaw, rule, encodedSegments, findings)...)
+					findings = append(findings, d.detectFragmentWithRuleTimed(fragment, currentRaw, *rule, encodedSegments, findings)...)
 				}
 			}
 			// Pool entries must be blank because later scans may run on any goroutine.
@@ -847,7 +880,23 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		return findings
 	}
 
-	matches := r.Regex.FindAllStringIndex(currentRaw, -1)
+	numSubexp := r.Regex.NumSubexp()
+	var (
+		matches    [][]int
+		submatches [][]int
+	)
+	if numSubexp > 0 {
+		// One engine pass for offsets + capture groups (avoids a second WASM
+		// subject copy under go-re2 for every hit).
+		submatches = r.Regex.FindAllStringSubmatchIndex(currentRaw, -1)
+		matches = make([][]int, len(submatches))
+		for i, sm := range submatches {
+			// Copy so later matchIndex mutations do not clobber capture indices.
+			matches[i] = []int{sm[0], sm[1]}
+		}
+	} else {
+		matches = r.Regex.FindAllStringIndex(currentRaw, -1)
+	}
 	if len(matches) == 0 {
 		return findings
 	}
@@ -857,7 +906,7 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 	newlineComputed := false
 
 	// Reuse the matches slice from above instead of calling FindAllStringIndex again.
-	for _, matchIndex := range matches {
+	for matchNum, matchIndex := range matches {
 		// Extract secret from match
 		secret := strings.Trim(currentRaw[matchIndex[0]:matchIndex[1]], "\n")
 		filterMatchStartIdx, filterMatchEndIdx := matchIndex[0], matchIndex[1]
@@ -941,19 +990,27 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		}
 
 		// Set the value of |secret|, if the pattern contains at least one capture group.
-		// (The first element is the full match, hence we check >= 2.)
-		groups := r.Regex.FindStringSubmatch(finding.Secret)
-		if len(groups) >= 2 {
+		if numSubexp > 0 {
+			sm := submatches[matchNum]
+			groupAt := func(group int) string {
+				startIdx := 2 * group
+				if startIdx+1 >= len(sm) || sm[startIdx] < 0 {
+					return ""
+				}
+				return currentRaw[sm[startIdx]:sm[startIdx+1]]
+			}
 			if r.SecretGroup > 0 {
-				if len(groups) <= r.SecretGroup {
+				if r.SecretGroup > numSubexp {
 					// Config validation should prevent this
 					continue
 				}
-				finding.Secret = groups[r.SecretGroup]
+				// Unconditional assign matches FindStringSubmatch(groups[SecretGroup]),
+				// including empty string when the group did not participate.
+				finding.Secret = groupAt(r.SecretGroup)
 			} else {
 				// If |secretGroup| is not set, we will use the first suitable capture group.
-				for _, s := range groups[1:] {
-					if len(s) > 0 {
+				for g := 1; g <= numSubexp; g++ {
+					if s := groupAt(g); len(s) > 0 {
 						finding.Secret = s
 						break
 					}
@@ -964,8 +1021,10 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 			names := r.Regex.SubexpNames()
 			captures := make(map[string]string)
 			for i, name := range names {
-				if i > 0 && name != "" && i < len(groups) && groups[i] != "" {
-					captures[name] = groups[i]
+				if i > 0 && name != "" {
+					if g := groupAt(i); g != "" {
+						captures[name] = g
+					}
 				}
 			}
 			if len(captures) > 0 {
