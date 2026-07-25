@@ -569,10 +569,12 @@ func (s *GitHub) downloadAndScan(ctx context.Context, rawURL string, reader io.R
 		s.restRetry.Decider = githubRetryDecider
 		s.restRetry.StateExtractor = githubRateLimitStateExtractor
 	}
+	httpClient := httpclient.NewAuthenticatedClient(s.Token, s.restRetry, s.apiHost())
+	httpClient.Timeout = downloadTimeout
 	return downloadAndScanSource(ctx, sourceDownloadOptions{
 		URL:             rawURL,
 		Reader:          reader,
-		HTTPClient:      httpclient.NewAuthenticatedClient(s.Token, s.restRetry, s.apiHost()),
+		HTTPClient:      httpClient,
 		Path:            path,
 		Attrs:           attrs,
 		BearerToken:     bearerToken,
