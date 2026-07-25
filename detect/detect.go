@@ -325,6 +325,13 @@ func NewDetectorContext(ctx context.Context, cfg *config.Config, valOpts Validat
 	if compileErr := cfg.CompileFiltersWith(exprRuntime, nil); compileErr != nil {
 		logging.Fatal().Err(compileErr).Msg("failed to compile filters")
 	}
+	// Refresh rule pointers after filter programs are attached to Config.Rules.
+	for i, ruleID := range d.rulesBySpecificity {
+		if rule, ok := cfg.Rules[ruleID]; ok {
+			r := rule
+			d.rulesByPtr[i] = &r
+		}
+	}
 
 	// Set up validation pool when enabled.
 	if valOpts.Enabled && validationRuntime != nil {
