@@ -320,9 +320,9 @@ func NewDetectorContext(ctx context.Context, cfg *config.Config, valOpts Validat
 	}
 	exprRuntime.SetTokenizerProvider(d.Tokenizer)
 
-	// Compile only global prefilter programs so they are available before scanning.
-	// Global finding filters and per-rule filters compile lazily on first candidate.
-	if compileErr := cfg.CompileFilters(nil); compileErr != nil {
+	// Compile global + per-rule filters with the detector runtime so token
+	// efficiency filters share the scan-time tokenizer provider.
+	if compileErr := cfg.CompileFiltersWith(exprRuntime, nil); compileErr != nil {
 		logging.Fatal().Err(compileErr).Msg("failed to compile filters")
 	}
 
@@ -371,6 +371,9 @@ func (d *Detector) Tokenizer() *tiktoken.Tiktoken {
 }
 
 func (d *Detector) globalFilterProgram() (exprruntime.Program, bool, error) {
+	if prg := d.Config.FilterProgram(); prg != nil {
+		return prg, true, nil
+	}
 	if d.Config.Filter == "" {
 		return nil, false, nil
 	}
@@ -410,9 +413,6 @@ func (d *Detector) validationProgram(ruleID string) (exprruntime.Program, bool, 
 }
 
 func (d *Detector) ruleFilterProgram(r config.Rule) (exprruntime.Program, bool, error) {
-	d.filterProgramM.Lock()
-	defer d.filterProgramM.Unlock()
-
 	rule := r
 	cacheable := false
 	if cfgRule, ok := d.Config.Rules[r.RuleID]; ok {
@@ -422,13 +422,17 @@ func (d *Detector) ruleFilterProgram(r config.Rule) (exprruntime.Program, bool, 
 	if rule.Filter == "" {
 		return nil, false, nil
 	}
+	// Prefer the program attached at CompileFilters time (lock-free).
+	if prg := rule.FilterProgram(); prg != nil {
+		return prg, true, nil
+	}
+
+	d.filterProgramM.Lock()
+	defer d.filterProgramM.Unlock()
 	if cacheable {
 		if prg := d.filterPrograms[rule.RuleID]; prg != nil {
 			return prg, true, nil
 		}
-	}
-	if prg := rule.FilterProgram(); prg != nil {
-		return prg, true, nil
 	}
 	prg, err := d.exprRuntime.CompileFilter(rule.Filter, nil)
 	if err != nil {
@@ -1058,16 +1062,20 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		// Build finding map once, only when at least one filter program is compiled.
 		var findingMap map[string]any
 		if hasGlobalFilter || hasRuleFilter {
-			findingMap = make(map[string]any, 12)
-			for key, value := range finding.ToExprMap() {
-				findingMap[key] = value
+			findingMap = map[string]any{
+				"secret":               finding.Secret,
+				"match":                finding.Match,
+				"line":                 finding.Line,
+				"rule_id":              finding.RuleID,
+				"description":          finding.Description,
+				"context":              finding.ExprContext(),
+				"entropy":              strconv.FormatFloat(entropy, 'g', -1, 64),
+				"fragment_raw":         currentRaw,
+				"match_start_idx":      filterMatchStartIdx,
+				"match_end_idx":        filterMatchEndIdx,
+				"match_line_start_idx": 0,
+				"match_line_end_idx":   len(currentRaw),
 			}
-			findingMap["entropy"] = strconv.FormatFloat(entropy, 'g', -1, 64)
-			findingMap["fragment_raw"] = currentRaw
-			findingMap["match_start_idx"] = filterMatchStartIdx
-			findingMap["match_end_idx"] = filterMatchEndIdx
-			findingMap["match_line_start_idx"] = 0
-			findingMap["match_line_end_idx"] = len(currentRaw)
 			if newline := strings.LastIndexAny(currentRaw[:filterMatchStartIdx], "\r\n"); newline >= 0 {
 				findingMap["match_line_start_idx"] = newline + 1
 			}

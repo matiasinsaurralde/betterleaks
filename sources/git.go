@@ -385,6 +385,8 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 		diffFilesCh = s.Cmd.DiffFilesCh()
 		errCh       = s.Cmd.ErrCh()
 		wg          sync.WaitGroup
+		cachedSHA   string
+		cachedBase  map[string]string
 	)
 
 	// loop to range over both DiffFiles (stdout) and ErrCh (stderr)
@@ -412,26 +414,32 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 			}
 
 			// Build commit attributes and check prefilter / allowlists before
-			// allocating goroutines or fragment memory.
+			// allocating goroutines or fragment memory. Reuse base attrs across
+			// files in the same commit; clone per file for concurrent workers.
 			commitSHA := ""
-			commitAttrs := make(map[string]string)
+			var commitAttrs map[string]string
 			if gitdiffFile.PatchHeader != nil {
 				commitSHA = gitdiffFile.PatchHeader.SHA
-				commitAttrs[AttrGitSHA] = commitSHA
-				commitAttrs[AttrGitMessage] = gitdiffFile.PatchHeader.Message()
-				commitAttrs[AttrResource] = ResourceGitPatchContent
+				if commitSHA != cachedSHA || cachedBase == nil {
+					cachedBase = make(map[string]string, 8)
+					cachedBase[AttrGitSHA] = commitSHA
+					cachedBase[AttrGitMessage] = gitdiffFile.PatchHeader.Message()
+					cachedBase[AttrResource] = ResourceGitPatchContent
+					if s.RemoteURL != "" {
+						cachedBase[AttrGitRemoteURL] = s.RemoteURL
+						cachedBase[AttrGitPlatform] = s.Platform.String()
+					}
+					if !gitdiffFile.PatchHeader.AuthorDate.IsZero() {
+						cachedBase[AttrGitDate] = gitdiffFile.PatchHeader.AuthorDate.UTC().Format(time.RFC3339)
+					}
+					if gitdiffFile.PatchHeader.Author != nil {
+						cachedBase[AttrGitAuthorName] = gitdiffFile.PatchHeader.Author.Name
+						cachedBase[AttrGitAuthorEmail] = gitdiffFile.PatchHeader.Author.Email
+					}
+					cachedSHA = commitSHA
+				}
+				commitAttrs = maps.Clone(cachedBase)
 				commitAttrs[AttrPath] = gitdiffFile.NewName
-				if s.RemoteURL != "" {
-					commitAttrs[AttrGitRemoteURL] = s.RemoteURL
-					commitAttrs[AttrGitPlatform] = s.Platform.String()
-				}
-				if !gitdiffFile.PatchHeader.AuthorDate.IsZero() {
-					commitAttrs[AttrGitDate] = gitdiffFile.PatchHeader.AuthorDate.UTC().Format(time.RFC3339)
-				}
-				if gitdiffFile.PatchHeader.Author != nil {
-					commitAttrs[AttrGitAuthorName] = gitdiffFile.PatchHeader.Author.Name
-					commitAttrs[AttrGitAuthorEmail] = gitdiffFile.PatchHeader.Author.Email
-				}
 
 				if shouldSkipAttrs(s.ShouldSkip, commitAttrs) {
 					logging.Trace().
@@ -484,9 +492,9 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 						return nil
 					}
 					fragment := Fragment{
-						Raw:        textFragment.Raw(gitdiff.OpAdd),
+						Raw:        rawAddedLines(textFragment),
 						StartLine:  int(textFragment.NewPosition),
-						Attributes: commitAttrs,
+						Attributes: maps.Clone(commitAttrs),
 					}
 					fragment.SetAttr(AttrPath, gitdiffFile.NewName)
 
@@ -514,6 +522,28 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 		wg.Wait()
 		return nil
 	}
+}
+
+// rawAddedLines concatenates OpAdd lines from a text fragment. Equivalent to
+// TextFragment.Raw(OpAdd) but pre-sizes the builder from LinesAdded lengths.
+func rawAddedLines(tf *gitdiff.TextFragment) string {
+	if tf == nil || tf.LinesAdded == 0 {
+		return ""
+	}
+	size := 0
+	for _, l := range tf.Lines {
+		if l.Op == gitdiff.OpAdd {
+			size += len(l.Line)
+		}
+	}
+	var sb strings.Builder
+	sb.Grow(size)
+	for _, l := range tf.Lines {
+		if l.Op == gitdiff.OpAdd {
+			sb.WriteString(l.Line)
+		}
+	}
+	return sb.String()
 }
 
 // ResolveRemote resolves the SCM platform and remote URL for the given source.

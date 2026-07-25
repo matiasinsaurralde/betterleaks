@@ -564,9 +564,15 @@ func (s *GitHub) isExcluded(fullName string) bool {
 }
 
 func (s *GitHub) downloadAndScan(ctx context.Context, rawURL string, reader io.ReadCloser, path string, attrs map[string]string, bearerToken string, yield FragmentsFunc) error {
+	if s.restRetry == nil {
+		s.restRetry = httpclient.NewRetryTransport(nil)
+		s.restRetry.Decider = githubRetryDecider
+		s.restRetry.StateExtractor = githubRateLimitStateExtractor
+	}
 	return downloadAndScanSource(ctx, sourceDownloadOptions{
 		URL:             rawURL,
 		Reader:          reader,
+		HTTPClient:      httpclient.NewAuthenticatedClient(s.Token, s.restRetry, s.apiHost()),
 		Path:            path,
 		Attrs:           attrs,
 		BearerToken:     bearerToken,

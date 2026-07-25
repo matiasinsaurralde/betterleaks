@@ -128,7 +128,8 @@ type Config struct {
 	Filter string
 
 	// prefilterProgram and filterProgram hold global programs compiled by
-	// CompileFilters. Per-rule filter and validation compilation is lazy.
+	// CompileFilters / CompileFiltersWith. Per-rule filter programs are stored
+	// on each Rule; validation compilation remains lazy.
 	prefilterProgram exprruntime.Program
 	filterProgram    exprruntime.Program
 }
@@ -510,12 +511,24 @@ func (c *Config) FilterProgram() exprruntime.Program { return c.filterProgram }
 // SetFilterProgram stores a compiled global filter program.
 func (c *Config) SetFilterProgram(p exprruntime.Program) { c.filterProgram = p }
 
-// CompileFilters compiles only the global prefilter needed before scanning.
-// Global finding filters and per-rule filters compile lazily on first candidate.
+// CompileFilters compiles the global prefilter, global filter, and all per-rule
+// filters so the detect hot path can evaluate them without a compile mutex.
+// A fresh runtime is used; callers that need a shared tokenizer provider should
+// use CompileFiltersWith.
 func (c *Config) CompileFilters(tokenizer *tiktoken.Tiktoken) error {
 	runtime, err := exprruntime.New(nil)
 	if err != nil {
 		return fmt.Errorf("creating expr runtime: %w", err)
+	}
+	return c.CompileFiltersWith(runtime, tokenizer)
+}
+
+// CompileFiltersWith compiles filters using the provided runtime (and its
+// tokenizer provider). The detector uses this so token-efficiency filters share
+// the scan-time tokenizer.
+func (c *Config) CompileFiltersWith(runtime *exprruntime.Runtime, tokenizer *tiktoken.Tiktoken) error {
+	if runtime == nil {
+		return fmt.Errorf("expr runtime is nil")
 	}
 
 	if c.Prefilter != "" {
@@ -524,6 +537,26 @@ func (c *Config) CompileFilters(tokenizer *tiktoken.Tiktoken) error {
 			return fmt.Errorf("compiling global prefilter: %w", compileErr)
 		}
 		c.prefilterProgram = prg
+	}
+
+	if c.Filter != "" {
+		prg, compileErr := runtime.CompileFilter(c.Filter, tokenizer)
+		if compileErr != nil {
+			return fmt.Errorf("compiling global filter: %w", compileErr)
+		}
+		c.filterProgram = prg
+	}
+
+	for ruleID, rule := range c.Rules {
+		if rule.Filter == "" {
+			continue
+		}
+		prg, compileErr := runtime.CompileFilter(rule.Filter, tokenizer)
+		if compileErr != nil {
+			return fmt.Errorf("compiling rule %s filter: %w", ruleID, compileErr)
+		}
+		rule.SetFilterProgram(prg)
+		c.Rules[ruleID] = rule
 	}
 
 	return nil
