@@ -1,7 +1,7 @@
 package codec
 
 import (
-	"bytes"
+	"strings"
 
 	"github.com/betterleaks/betterleaks/logging"
 )
@@ -24,7 +24,10 @@ func (d *Decoder) Decode(data string, predecessors []*EncodedSegment) (string, [
 	segments := d.findEncodedSegments(data, predecessors)
 
 	if len(segments) > 0 {
-		result := bytes.NewBuffer(make([]byte, 0, len(data)))
+		// strings.Builder.String() returns its buffer without copying, unlike
+		// bytes.Buffer.String() which copies the whole assembled result.
+		var result strings.Builder
+		result.Grow(len(data))
 		encodedStart := 0
 		for _, segment := range segments {
 			result.WriteString(data[encodedStart:segment.encoded.start])
@@ -90,15 +93,20 @@ func (d *Decoder) findEncodedSegments(data string, predecessors []*EncodedSegmen
 		}
 
 		segments = append(segments, segment)
-		logging.Trace().
-			Str("decoder", m.encoding.kind.String()).
-			Msgf(
-				"segment found: original=%s pos=%s: %q -> %q",
-				segment.original,
-				segment.encoded,
-				encodedValue,
-				segment.decodedValue,
-			)
+		// Guard the disabled-by-default Trace log: without this, Go still eagerly
+		// evaluates kind.String() and boxes the four Msgf arguments into a
+		// variadic slice on every segment, even though the event is nil at the
+		// default InfoLevel.
+		if e := logging.Trace(); e != nil {
+			e.Str("decoder", m.encoding.kind.String()).
+				Msgf(
+					"segment found: original=%s pos=%s: %q -> %q",
+					segment.original,
+					segment.encoded,
+					encodedValue,
+					segment.decodedValue,
+				)
+		}
 	}
 
 	return segments
