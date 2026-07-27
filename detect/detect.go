@@ -622,7 +622,7 @@ func (d *Detector) Run(ctx context.Context, source sources.Source) iter.Seq[Resu
 func (d *Detector) ignore(finding report.Finding) bool {
 	logger := logging.With().Str("finding", finding.Secret).Logger()
 	path := finding.Attributes[sources.AttrPath]
-	globalFingerprint := fmt.Sprintf("%s:%s:%d", path, finding.RuleID, finding.StartLine)
+	globalFingerprint := path + ":" + finding.RuleID + ":" + strconv.Itoa(finding.StartLine)
 
 	if _, ok := d.gitleaksIgnore[globalFingerprint]; ok {
 		logger.Debug().
@@ -717,6 +717,11 @@ func (d *Detector) detectFragment(ctx context.Context, fragment sources.Fragment
 	currentDecodeDepth := 0
 	decoder := codec.NewDecoder()
 
+	// Newline offsets for location math depend only on fragment.Raw, so compute
+	// them at most once per fragment (lazily) and reuse across every rule and
+	// decode pass instead of rebuilding the table for each candidate rule.
+	newlines := &newlineCache{raw: fragment.Raw}
+
 ScanLoop:
 	for {
 		select {
@@ -748,7 +753,7 @@ ScanLoop:
 					break ScanLoop
 				default:
 					rule := d.Config.Rules[ruleID]
-					findings = append(findings, d.detectFragmentWithRuleTimed(fragment, currentRaw, rule, encodedSegments, findings)...)
+					findings = append(findings, d.detectFragmentWithRuleTimed(fragment, currentRaw, rule, encodedSegments, findings, newlines)...)
 				}
 			}
 			// Pool entries must be blank because later scans may run on any goroutine.
@@ -779,13 +784,14 @@ func (d *Detector) detectFragmentWithRuleTimed(fragment sources.Fragment,
 	currentRaw string,
 	r config.Rule,
 	encodedSegments []*codec.EncodedSegment,
-	priorFindings []report.Finding) []report.Finding {
+	priorFindings []report.Finding,
+	newlines *newlineCache) []report.Finding {
 	if d.RuleTimings == nil {
-		return d.detectFragmentWithRule(fragment, currentRaw, r, encodedSegments, priorFindings)
+		return d.detectFragmentWithRule(fragment, currentRaw, r, encodedSegments, priorFindings, newlines)
 	}
 
 	start := time.Now()
-	findings := d.detectFragmentWithRule(fragment, currentRaw, r, encodedSegments, priorFindings)
+	findings := d.detectFragmentWithRule(fragment, currentRaw, r, encodedSegments, priorFindings, newlines)
 	d.RuleTimings.Record(r.RuleID, time.Since(start))
 	return findings
 }
@@ -817,7 +823,8 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 	currentRaw string,
 	r config.Rule,
 	encodedSegments []*codec.EncodedSegment,
-	priorFindings []report.Finding) []report.Finding {
+	priorFindings []report.Finding,
+	newlines *newlineCache) []report.Finding {
 	var (
 		findings []report.Finding
 		logger   = fragment.Logger().With().Str("rule_id", r.RuleID).Logger()
@@ -847,17 +854,34 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		return findings
 	}
 
-	matches := r.Regex.FindAllStringIndex(currentRaw, -1)
+	// Single regex pass. Under the WASM re2 engine every Find* call copies the
+	// input across the WASM boundary, so for rules with capture groups we use
+	// FindAllStringSubmatchIndex to obtain the match bounds AND the capture-group
+	// offsets in a single crossing, instead of re-running FindStringSubmatch on
+	// every match further down.
+	hasGroups := r.Regex.NumSubexp() > 0
+	var matches [][]int
+	if hasGroups {
+		matches = r.Regex.FindAllStringSubmatchIndex(currentRaw, -1)
+	} else {
+		matches = r.Regex.FindAllStringIndex(currentRaw, -1)
+	}
 	if len(matches) == 0 {
 		return findings
 	}
 
-	// Lazily compute newline indices — only when we actually need location info.
-	var newlineIndices [][]int
-	newlineComputed := false
+	// Capture-group names are constant for the rule; fetch once, not per match.
+	var subexpNames []string
+	if hasGroups {
+		subexpNames = r.Regex.SubexpNames()
+	}
 
 	// Reuse the matches slice from above instead of calling FindAllStringIndex again.
-	for _, matchIndex := range matches {
+	for _, match := range matches {
+		// match[0:2] is the full match; match[2:] holds capture-group offsets when
+		// hasGroups. Derive a fresh 2-element slice for location/decode math so
+		// those helpers see the same shape they always have.
+		matchIndex := []int{match[0], match[1]}
 		// Extract secret from match
 		secret := strings.Trim(currentRaw[matchIndex[0]:matchIndex[1]], "\n")
 		filterMatchStartIdx, filterMatchEndIdx := matchIndex[0], matchIndex[1]
@@ -888,11 +912,7 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		// in the finding will be the line/column numbers of the _match_
 		// not the _secret_, which will be different if the secretGroup
 		// value is set for this rule
-		if !newlineComputed {
-			newlineIndices = findNewlineIndices(fragment.Raw)
-			newlineComputed = true
-		}
-		loc := location(newlineIndices, fragment.Raw, matchIndex)
+		loc := location(newlines.get(), fragment.Raw, matchIndex)
 
 		if matchIndex[1] > loc.endLineIndex {
 			loc.endLineIndex = matchIndex[1]
@@ -942,7 +962,21 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 
 		// Set the value of |secret|, if the pattern contains at least one capture group.
 		// (The first element is the full match, hence we check >= 2.)
-		groups := r.Regex.FindStringSubmatch(finding.Secret)
+		//
+		// Derive capture groups from the single-pass offsets when the full match
+		// has no leading/trailing newline that was trimmed (the common case) — this
+		// is exactly what re-running the regex on the secret would return, but
+		// without another WASM boundary crossing. Fall back to the historical
+		// re-run only when trimming changed the match, preserving behavior for
+		// regexes that capture newlines.
+		var groups []string
+		if hasGroups {
+			if currentRaw[match[0]:match[1]] == finding.Secret {
+				groups = submatchStrings(currentRaw, match)
+			} else {
+				groups = r.Regex.FindStringSubmatch(finding.Secret)
+			}
+		}
 		if len(groups) >= 2 {
 			if r.SecretGroup > 0 {
 				if len(groups) <= r.SecretGroup {
@@ -961,7 +995,7 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 			}
 
 			// Extract named capture groups for use as template variables.
-			names := r.Regex.SubexpNames()
+			names := subexpNames
 			captures := make(map[string]string)
 			for i, name := range names {
 				if i > 0 && name != "" && i < len(groups) && groups[i] != "" {
@@ -1000,9 +1034,9 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		var findingMap map[string]any
 		if hasGlobalFilter || hasRuleFilter {
 			findingMap = make(map[string]any, 12)
-			for key, value := range finding.ToExprMap() {
-				findingMap[key] = value
-			}
+			// Write finding fields straight into findingMap instead of building a
+			// throwaway intermediate map via ToExprMap and copying it key-by-key.
+			finding.WriteExprMap(findingMap)
 			findingMap["entropy"] = strconv.FormatFloat(entropy, 'g', -1, 64)
 			findingMap["fragment_raw"] = currentRaw
 			findingMap["match_start_idx"] = filterMatchStartIdx
@@ -1064,11 +1098,11 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 	}
 
 	// Process required rules and create findings with auxiliary findings
-	return d.processRequiredRules(fragment, currentRaw, r, encodedSegments, findings, logger)
+	return d.processRequiredRules(fragment, currentRaw, r, encodedSegments, findings, logger, newlines)
 }
 
 // processRequiredRules handles the logic for multi-part rules with auxiliary findings
-func (d *Detector) processRequiredRules(fragment sources.Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment, primaryFindings []report.Finding, logger zerolog.Logger) []report.Finding {
+func (d *Detector) processRequiredRules(fragment sources.Fragment, currentRaw string, r config.Rule, encodedSegments []*codec.EncodedSegment, primaryFindings []report.Finding, logger zerolog.Logger, newlines *newlineCache) []report.Finding {
 	if len(primaryFindings) == 0 {
 		logger.Debug().Msg("no primary findings to process for required rules")
 		return primaryFindings
@@ -1089,7 +1123,7 @@ func (d *Detector) processRequiredRules(fragment sources.Fragment, currentRaw st
 		inheritedFragment.InheritedFromFinding = true
 
 		// Call detectRule once for each required rule
-		requiredFindings := d.detectFragmentWithRuleTimed(inheritedFragment, currentRaw, rule, encodedSegments, nil)
+		requiredFindings := d.detectFragmentWithRuleTimed(inheritedFragment, currentRaw, rule, encodedSegments, nil, newlines)
 		allRequiredFindings[requiredRule.RuleID] = requiredFindings
 
 		logger.Debug().

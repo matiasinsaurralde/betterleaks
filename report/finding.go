@@ -1,10 +1,10 @@
 package report
 
 import (
-	"fmt"
 	"maps"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/betterleaks/betterleaks/sources"
@@ -333,11 +333,13 @@ func (f *Finding) SetFingerprint() {
 	path := f.Attributes[sources.AttrPath]
 	commit := f.Attributes[sources.AttrGitSHA]
 
-	globalFingerprint := fmt.Sprintf("%s:%s:%d", path, f.RuleID, f.StartLine)
+	// Plain concatenation avoids fmt.Sprintf's reflection + extra allocations on
+	// this per-finding hot path, and only builds the global form when needed.
+	ln := strconv.Itoa(f.StartLine)
 	if commit != "" {
-		f.Fingerprint = fmt.Sprintf("%s:%s:%s:%d", commit, path, f.RuleID, f.StartLine)
+		f.Fingerprint = commit + ":" + path + ":" + f.RuleID + ":" + ln
 	} else {
-		f.Fingerprint = globalFingerprint
+		f.Fingerprint = path + ":" + f.RuleID + ":" + ln
 	}
 }
 
@@ -352,4 +354,16 @@ func (f *Finding) ToExprMap() map[string]string {
 		"description": f.Description,
 		"context":     f.exprContext,
 	}
+}
+
+// WriteExprMap writes the fixed-shape finding fields directly into dst, avoiding
+// the throwaway intermediate map (and copy loop) that ToExprMap forces when the
+// caller already has a destination map. Used on the per-finding filter hot path.
+func (f *Finding) WriteExprMap(dst map[string]any) {
+	dst["secret"] = f.Secret
+	dst["match"] = f.Match
+	dst["line"] = f.Line
+	dst["rule_id"] = f.RuleID
+	dst["description"] = f.Description
+	dst["context"] = f.exprContext
 }

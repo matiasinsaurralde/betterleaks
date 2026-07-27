@@ -127,13 +127,32 @@ func shannonEntropy(data string) (entropy float64) {
 		return 0
 	}
 
-	charCounts := make(map[rune]int)
+	// Count ASCII runes (the overwhelming majority of secrets) in a stack array
+	// to avoid a map allocation on this per-finding hot path; fall back to a map
+	// only for the rare non-ASCII rune. The divisor stays len(data) (byte count)
+	// to preserve the exact values the previous map-based implementation produced.
+	var ascii [128]int
+	var wide map[rune]int
 	for _, char := range data {
-		charCounts[char]++
+		if char < 128 {
+			ascii[char]++
+		} else {
+			if wide == nil {
+				wide = make(map[rune]int)
+			}
+			wide[char]++
+		}
 	}
 
 	invLength := 1.0 / float64(len(data))
-	for _, count := range charCounts {
+	for _, count := range ascii {
+		if count == 0 {
+			continue
+		}
+		freq := float64(count) * invLength
+		entropy -= freq * math.Log2(freq)
+	}
+	for _, count := range wide {
 		freq := float64(count) * invLength
 		entropy -= freq * math.Log2(freq)
 	}
@@ -230,11 +249,15 @@ func stripEmptyMeta(m map[string]any) map[string]any {
 	return out
 }
 
-// findNewlineIndices returns the start indices of all newlines in s.
+// findNewlineIndices returns the byte offsets of all newlines in s.
 // This replaces the previous regex-based approach which was expensive
 // when using go-re2 (WASM overhead for a literal \n search).
-func findNewlineIndices(s string) [][]int {
-	indices := make([][]int, 0, strings.Count(s, "\n"))
+//
+// The result is a flat []int of newline offsets. Callers previously received
+// [][]int{{idx, idx+1}, ...} but only ever used the first element (the newline
+// offset), so a flat slice avoids one heap allocation per line.
+func findNewlineIndices(s string) []int {
+	indices := make([]int, 0, strings.Count(s, "\n"))
 	offset := 0
 	for {
 		i := strings.IndexByte(s[offset:], '\n')
@@ -242,10 +265,25 @@ func findNewlineIndices(s string) [][]int {
 			break
 		}
 		idx := offset + i
-		indices = append(indices, []int{idx, idx + 1})
+		indices = append(indices, idx)
 		offset = idx + 1
 	}
 	return indices
+}
+
+// submatchStrings converts capture-group offsets returned by
+// FindAllStringSubmatchIndex into the []string form returned by
+// FindStringSubmatch: index 0 is the full match and index i is capture group i.
+// A non-participating group (offset -1) becomes "".
+func submatchStrings(s string, m []int) []string {
+	groups := make([]string, len(m)/2)
+	for i := range groups {
+		start, end := m[2*i], m[2*i+1]
+		if start >= 0 && end >= start {
+			groups[i] = s[start:end]
+		}
+	}
+	return groups
 }
 
 // containsAllowSignature checks if the line contains any of the allow signatures
