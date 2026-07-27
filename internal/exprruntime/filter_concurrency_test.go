@@ -94,3 +94,32 @@ func TestFilterTokenizerProviderShared(t *testing.T) {
 	defer mu.Unlock()
 	require.Positive(t, calls, "tokenizer provider should have been invoked")
 }
+
+// TestPrefilterTokenizerProvider guards parity with the pre-pooling behavior:
+// the tokenizer provider must also reach failsTokenEfficiency in a prefilter,
+// not just a filter. Before the fix, the compile-time capture was gated on
+// filter mode only, so a prefilter's provider stayed nil and
+// failsTokenEfficiency always returned false.
+func TestPrefilterTokenizerProvider(t *testing.T) {
+	env, err := New(nil)
+	require.NoError(t, err)
+
+	var called bool
+	var mu sync.Mutex
+	env.SetTokenizerProvider(func() *tiktoken.Tiktoken {
+		mu.Lock()
+		called = true
+		mu.Unlock()
+		return nil // nil tokenizer => failsTokenEfficiency returns false, but must be *invoked*
+	})
+
+	prg, err := env.CompilePrefilter(`failsTokenEfficiency(get(attributes, "path", ""))`)
+	require.NoError(t, err)
+
+	_, err = env.EvalPrefilter(prg, map[string]string{"path": "some/long/path/value"})
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.True(t, called, "prefilter must invoke the tokenizer provider (parity with filter)")
+}

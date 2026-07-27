@@ -158,8 +158,11 @@ func (e *Runtime) compile(mode compileMode, expression string, tokenizer *tiktok
 	// time so the per-eval env does not have to rebuild the runtimeBindings (and
 	// the filter namespace + failsTokenEfficiency closure) on every evaluation.
 	// failsTokenEfficiency no longer mutates rt, so this shared rt stays immutable
-	// and safe for concurrent filter evaluation.
-	if mode == modeFilter {
+	// and safe for concurrent evaluation. Both filter and prefilter expose an rt
+	// (validation builds its rt per-eval), and the previous per-eval code applied
+	// the provider to both, so do the same here to keep failsTokenEfficiency
+	// working in a hand-written prefilter.
+	if mode == modeFilter || mode == modePrefilter {
 		if rt, ok := b["__runtime"].(*runtimeBindings); ok {
 			rt.tokenizerProvider = e.tokenizerProvider
 		}
