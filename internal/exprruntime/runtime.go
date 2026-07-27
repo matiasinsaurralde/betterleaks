@@ -154,6 +154,16 @@ func (e *Runtime) compile(mode compileMode, expression string, tokenizer *tiktok
 	e.mu.RUnlock()
 
 	b, options := e.compileBindings(mode, tokenizer)
+	// Store the tokenizer provider on the program's runtime bindings at compile
+	// time so the per-eval env does not have to rebuild the runtimeBindings (and
+	// the filter namespace + failsTokenEfficiency closure) on every evaluation.
+	// failsTokenEfficiency no longer mutates rt, so this shared rt stays immutable
+	// and safe for concurrent filter evaluation.
+	if mode == modeFilter {
+		if rt, ok := b["__runtime"].(*runtimeBindings); ok {
+			rt.tokenizerProvider = e.tokenizerProvider
+		}
+	}
 	vmPrg, err := expr.Compile(exprText, append([]expr.Option{expr.Env(b)}, options...)...)
 	if err != nil {
 		if exprText != expression {
@@ -225,17 +235,12 @@ func (e *Runtime) EvalPrefilter(prg Program, attributes map[string]string) (bool
 
 func (prg Program) evalBindings() bindings {
 	if prg.bindings != nil {
-		b := cloneBindings(prg.bindings)
-		if rt, ok := b["__runtime"].(*runtimeBindings); ok {
-			rtCopy := *rt
-			rt = &rtCopy
-			rt.tokenizer = prg.tokenizer
-			rt.tokenizerProvider = prg.tokenizerProvider
-			b["__runtime"] = rt
-			b["filter"] = filterNamespace(rt)
-			b["failsTokenEfficiency"] = rt.failsTokenEfficiency
-		}
-		return b
+		// The compiled bindings already carry an immutable runtimeBindings with
+		// the tokenizer and provider resolved at compile time, so a single shallow
+		// clone (to hold the per-eval finding/attributes) is all that's needed —
+		// no per-eval runtimeBindings copy, filter-namespace map, or bound-method
+		// closure allocation.
+		return cloneBindings(prg.bindings)
 	}
 	return bindings{}
 }
@@ -248,8 +253,15 @@ func cloneBindings(src bindings) bindings {
 	return dst
 }
 
+// vmPool reuses vm.VM instances across filter/prefilter evaluations. vm.VM.Run
+// fully resets its Stack/Scopes/Variables state on entry and recovers panics
+// into errors, so a pooled VM is safe to reuse (one at a time per goroutine).
+var vmPool = sync.Pool{New: func() any { return new(vm.VM) }}
+
 func runBool(prg Program, b bindings, name string) (bool, error) {
-	val, err := expr.Run(prg.vm, b)
+	v := vmPool.Get().(*vm.VM)
+	val, err := v.Run(prg.vm, b)
+	vmPool.Put(v)
 	if err != nil {
 		return false, err
 	}
