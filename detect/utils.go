@@ -271,21 +271,6 @@ func findNewlineIndices(s string) []int {
 	return indices
 }
 
-// submatchStrings converts capture-group offsets returned by
-// FindAllStringSubmatchIndex into the []string form returned by
-// FindStringSubmatch: index 0 is the full match and index i is capture group i.
-// A non-participating group (offset -1) becomes "".
-func submatchStrings(s string, m []int) []string {
-	groups := make([]string, len(m)/2)
-	for i := range groups {
-		start, end := m[2*i], m[2*i+1]
-		if start >= 0 && end >= start {
-			groups[i] = s[start:end]
-		}
-	}
-	return groups
-}
-
 // containsAllowSignature checks if the line contains any of the allow signatures
 func containsAllowSignature(line string) bool {
 	for _, sig := range allowSignatures {

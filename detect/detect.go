@@ -854,34 +854,25 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 		return findings
 	}
 
-	// Single regex pass. Under the WASM re2 engine every Find* call copies the
-	// input across the WASM boundary, so for rules with capture groups we use
-	// FindAllStringSubmatchIndex to obtain the match bounds AND the capture-group
-	// offsets in a single crossing, instead of re-running FindStringSubmatch on
-	// every match further down.
-	hasGroups := r.Regex.NumSubexp() > 0
-	var matches [][]int
-	if hasGroups {
-		matches = r.Regex.FindAllStringSubmatchIndex(currentRaw, -1)
-	} else {
-		matches = r.Regex.FindAllStringIndex(currentRaw, -1)
-	}
+	matches := r.Regex.FindAllStringIndex(currentRaw, -1)
 	if len(matches) == 0 {
 		return findings
 	}
 
-	// Capture-group names are constant for the rule; fetch once, not per match.
+	// Whether the rule has capture groups is constant, as are the group names.
+	// Compute both once instead of per match. Rules without capture groups skip
+	// the per-match FindStringSubmatch re-run entirely (its result was never
+	// usable for them). Rules with groups keep the historical behavior of
+	// re-running the regex on the extracted secret, which is context-sensitive
+	// (e.g. \b/\B) and must not change.
+	hasGroups := r.Regex.NumSubexp() > 0
 	var subexpNames []string
 	if hasGroups {
 		subexpNames = r.Regex.SubexpNames()
 	}
 
 	// Reuse the matches slice from above instead of calling FindAllStringIndex again.
-	for _, match := range matches {
-		// match[0:2] is the full match; match[2:] holds capture-group offsets when
-		// hasGroups. Derive a fresh 2-element slice for location/decode math so
-		// those helpers see the same shape they always have.
-		matchIndex := []int{match[0], match[1]}
+	for _, matchIndex := range matches {
 		// Extract secret from match
 		secret := strings.Trim(currentRaw[matchIndex[0]:matchIndex[1]], "\n")
 		filterMatchStartIdx, filterMatchEndIdx := matchIndex[0], matchIndex[1]
@@ -962,20 +953,12 @@ func (d *Detector) detectFragmentWithRule(fragment sources.Fragment,
 
 		// Set the value of |secret|, if the pattern contains at least one capture group.
 		// (The first element is the full match, hence we check >= 2.)
-		//
-		// Derive capture groups from the single-pass offsets when the full match
-		// has no leading/trailing newline that was trimmed (the common case) — this
-		// is exactly what re-running the regex on the secret would return, but
-		// without another WASM boundary crossing. Fall back to the historical
-		// re-run only when trimming changed the match, preserving behavior for
-		// regexes that capture newlines.
+		// Only rules that actually have capture groups need this re-run; skipping
+		// it for group-less rules avoids a wasted regex execution (a WASM boundary
+		// crossing under the re2 engine) whose result was never usable.
 		var groups []string
 		if hasGroups {
-			if currentRaw[match[0]:match[1]] == finding.Secret {
-				groups = submatchStrings(currentRaw, match)
-			} else {
-				groups = r.Regex.FindStringSubmatch(finding.Secret)
-			}
+			groups = r.Regex.FindStringSubmatch(finding.Secret)
 		}
 		if len(groups) >= 2 {
 			if r.SecretGroup > 0 {
