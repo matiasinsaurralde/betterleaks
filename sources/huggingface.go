@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -665,7 +664,6 @@ func (s *HuggingFace) repoAttributes(repo huggingFaceRepo, resource string) map[
 }
 
 func (s *HuggingFace) wrapYieldWithAttrs(attrs map[string]string, yield FragmentsFunc) FragmentsFunc {
-	var mu sync.Mutex
 	return func(fragment Fragment, err error) error {
 		if err == nil {
 			for k, v := range attrs {
@@ -678,8 +676,6 @@ func (s *HuggingFace) wrapYieldWithAttrs(attrs map[string]string, yield Fragment
 				return nil
 			}
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		return yield(fragment, err)
 	}
 }

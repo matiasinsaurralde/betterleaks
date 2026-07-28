@@ -149,22 +149,20 @@ func findEncodingMatches(data string) []encodingMatch {
 		// --- Percent encoding: %XX ---
 		if c == '%' && i+2 < n && isHexChar[data[i+1]] && isHexChar[data[i+2]] {
 			start := i
-			// Scan forward to find the last %XX on this line.
-			// The regex `%XX(?:.*%XX)?` is greedy and matches from the first
-			// %XX through any chars (except \n) to the last %XX on the line.
-			lastPercentEnd := i + 3
-			j := i + 3
-			for j < n && data[j] != '\n' {
-				if data[j] == '%' && j+2 < n && isHexChar[data[j+1]] && isHexChar[data[j+2]] {
-					lastPercentEnd = j + 3
-				}
-				j++
+			// Match contiguous percent-encoded bytes (%XX%YY...), not first-to-last
+			// on the line. The old greedy span forced full-line decode on minified
+			// single-line files that contained a single %XX early on.
+			end := i + 3
+			j := end
+			for j+2 < n && data[j] == '%' && isHexChar[data[j+1]] && isHexChar[data[j+2]] {
+				j += 3
+				end = j
 			}
 			all = append(all, encodingMatch{
 				encoding: encodings[0], // percent
-				startEnd: startEnd{start, lastPercentEnd},
+				startEnd: startEnd{start, end},
 			})
-			i = lastPercentEnd
+			i = end
 			continue
 		}
 

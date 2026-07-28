@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -887,9 +886,9 @@ func (s *GitLab) projectAttributes(proj *gitlabProject, resource string) map[str
 
 // wrapGitLabYield stamps project-level attributes onto every fragment and
 // applies ShouldSkip as a final per-fragment filter (L3). Callers must use
-// the returned yield in place of the original.
+// the returned yield in place of the original. Detection is concurrent; each
+// fragment owns its attribute map after stamping.
 func wrapGitLabYield(skip SkipFunc, attrs map[string]string, yield FragmentsFunc) FragmentsFunc {
-	var mu sync.Mutex
 	return func(fragment Fragment, err error) error {
 		if err == nil {
 			for k, v := range attrs {
@@ -902,8 +901,6 @@ func wrapGitLabYield(skip SkipFunc, attrs map[string]string, yield FragmentsFunc
 				return nil
 			}
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		return yield(fragment, err)
 	}
 }

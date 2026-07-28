@@ -29,7 +29,10 @@ type Files struct {
 	MaxArchiveDepth int
 }
 
-// scanTargets yields scan targets to a callback func
+// scanTargets yields scan targets to a callback func. The callback may run
+// concurrently from fastwalk workers; callers that need serial delivery must
+// synchronize themselves. Fragments schedules Sema work from the callback and
+// must not hold a lock across Sema.Acquire.
 func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) error) error {
 	// fastwalk only accepts directory roots. Lstat also preserves the existing
 	// symlink handling when the requested root is a single file or symlink.
@@ -44,9 +47,6 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 		return nil
 	}
 
-	// fastwalk visits paths concurrently, but scanTargets has always exposed a
-	// serial callback. Keep that contract without serializing file inspection.
-	var yieldMu sync.Mutex
 	walkFn := func(path string, d fs.DirEntry, err error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -126,8 +126,6 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
 			return nil
 		}
 
-		yieldMu.Lock()
-		defer yieldMu.Unlock()
 		return yield(scanTarget, nil)
 	}
 

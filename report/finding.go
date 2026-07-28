@@ -221,6 +221,11 @@ func (f *Finding) SetExprContext(context string) {
 	f.exprContext = context
 }
 
+// ExprContext returns the text previously stored by SetExprContext.
+func (f *Finding) ExprContext() string {
+	return f.exprContext
+}
+
 // Print writes a verbose finding using the pretty box format.
 func (f Finding) Print(noColor bool, redact uint) {
 	f.printPretty(noColor, redact)

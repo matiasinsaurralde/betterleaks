@@ -2,6 +2,7 @@ package words
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -77,10 +78,16 @@ func TestHasMatchInList(t *testing.T) {
 				if got != nil {
 					t.Errorf("HasMatchInList() = %v, want nil", got)
 				}
+				if ContainsWord(tt.word, tt.minLen) {
+					t.Errorf("ContainsWord() = true, want false")
+				}
 				return
 			}
 			if got == nil || len(got) == 0 {
 				t.Fatalf("HasMatchInList() = nil, want result with UniqueWords %v", tt.wantUniqueWords)
+			}
+			if !ContainsWord(tt.word, tt.minLen) {
+				t.Errorf("ContainsWord() = false, want true")
 			}
 			r := got[0]
 			if r.WordCount < tt.wantMinMatchCount {
@@ -101,5 +108,45 @@ func TestHasMatchInList(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkContainsWordMiss(b *testing.B) {
+	secret := "xK9mP2qR7vL4nW8sT1yU6zA3bC5dE0fG"
+	b.ReportAllocs()
+	for b.Loop() {
+		if ContainsWord(secret, 5) {
+			b.Fatal("unexpected hit")
+		}
+	}
+}
+
+func BenchmarkHasMatchInListMiss(b *testing.B) {
+	secret := "xK9mP2qR7vL4nW8sT1yU6zA3bC5dE0fG"
+	b.ReportAllocs()
+	for b.Loop() {
+		if HasMatchInList(secret, 5) != nil {
+			b.Fatal("unexpected hit")
+		}
+	}
+}
+
+func BenchmarkContainsWordHit(b *testing.B) {
+	secret := "xxpasswordxx" + strings.Repeat("z", 64)
+	b.ReportAllocs()
+	for b.Loop() {
+		if !ContainsWord(secret, 5) {
+			b.Fatal("expected hit")
+		}
+	}
+}
+
+func BenchmarkHasMatchInListHit(b *testing.B) {
+	secret := "xxpasswordxx" + strings.Repeat("z", 64)
+	b.ReportAllocs()
+	for b.Loop() {
+		if HasMatchInList(secret, 5) == nil {
+			b.Fatal("expected hit")
+		}
 	}
 }
